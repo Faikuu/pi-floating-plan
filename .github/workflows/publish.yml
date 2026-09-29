@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time; queued instead of cancelled so no publish is lost.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push version bump + create tag/release
+      id-token: write # npm trusted publishing (OIDC) — no NPM_TOKEN
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags/history needed for changelog and previous version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # ships npm >= 11.5, required for OIDC publishing
+          registry-url: https://registry.npmjs.org/
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Bump version
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          next=$(node -p "(() => { const [a,b,c] = require('./package.json').version.split('.').map(Number); return \`\${a}.\${b}.\${c + 1}\`; })()")
+          npm version "$next" --no-git-tag-version --allow-same-version
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "previous=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check if version is already on npm
+        id: check
+        run: |
+          name=$(node -p "require('./package.json').name")
+          published=$(npm view "$name@${{ steps.version.outputs.version }}" version 2>/dev/null || true)
+          if [ -n "$published" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$name@${{ steps.version.outputs.version }} is already on npm — skipping publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.check.outputs.published == 'false'
+        run: npm publish
+        env:
+          # npm requires the auth config to exist; auth itself is the OIDC
+          # id-token, so no real token is used.
+          NODE_AUTH_TOKEN: "oidc-no-token-required"
+
+      - name: Commit, tag, and create GitHub release
+        if: steps.check.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # [skip ci] stops this commit from re-triggering the release workflow
+          git add package.json package-lock.json
+          git commit -m "chore: release v$VERSION [skip ci]"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin HEAD:main --follow-tags
+
+          git fetch --tags --quiet
+          previous_tag=$(git tag --list 'v*' --sort=-v:refname | grep -v "^v$VERSION$" | head -n1 || true)
+          if [ -n "$previous_tag" ]; then
+            notes=$(git log --pretty=format:'- %s (%h)' "$previous_tag..v$VERSION")
+          else
+            notes=$(git log --pretty=format:'- %s (%h)' -n 20 "v$VERSION")
+          fi
+          printf '%s\n' "$notes" > notes.md
+
+          gh release create "v$VERSION" --title "v$VERSION" --notes-file notes.md
