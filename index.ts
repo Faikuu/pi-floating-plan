@@ -22,7 +22,8 @@ import type { KeyId, TUI } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { PlanPanel } from "./lib/panel.ts";
-import { ANCHORS, configPatch, parseConfig, type FloatingPlanConfig, type PlanAnchor } from "./lib/config.ts";
+import { ANCHORS, configPatch, MAX_PADDING, parseConfig, type FloatingPlanConfig, type PlanAnchor } from "./lib/config.ts";
+import { overlayOptions } from "./lib/position.ts";
 import { normalizePlan, planFromText, planSummary, planToText, type Plan, type PlanStatus, type PlanStep } from "./lib/plan.ts";
 import { createPlanStore, type PlanStore } from "./lib/plan-store.ts";
 import { globalSettingsPath, readSettings, writeSettings } from "./lib/settings.ts";
@@ -80,10 +81,18 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 	let tui: TUI | undefined;
 	let closing: (() => void) | undefined;
 	let overlayOpen = false;
+	let openPromise: Promise<void> | undefined;
+	let warnedAboutScrollback = false;
 	let unsubscribe: (() => void) | undefined;
 
 	function limits() {
 		return { maxSteps: config.maxSteps, maxTextLength: config.maxTextLength };
+	}
+
+	/** The panel's current placement, in the terms the commands speak. */
+	function describePosition(): string {
+		const unit = config.padding === 1 ? "row/column" : "rows/columns";
+		return `Panel anchored ${config.anchor}, ${config.padding} ${unit} from the edges it touches.`;
 	}
 
 	/** Store a plan and redraw only if it actually changed. */
@@ -105,10 +114,63 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 		panel = undefined;
 	}
 
+	/**
+	 * Persist a settings change, keeping it only if the file could be written.
+	 *
+	 * The in-memory config is updated first so the patch is written from the
+	 * new value, and rolled back on failure so what is on screen always
+	 * matches what is on disk.
+	 */
+	async function persistChanges(changes: Partial<FloatingPlanConfig>, context: ExtensionCommandContext): Promise<boolean> {
+		const file = globalSettingsPath();
+		const previous = config;
+		const next = { ...config, ...changes };
+		config = next;
+		try {
+			await withFileMutationQueue(file, async () => {
+				await writeSettings(file, configPatch(next, changes));
+			});
+			return true;
+		} catch (error) {
+			config = previous;
+			context.ui.notify(`Could not save to ${file}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return false;
+		}
+	}
+
+	/**
+	 * Rebuild the overlay.
+	 *
+	 * pi reads an overlay's placement once, when it is shown, so an anchor or
+	 * padding change cannot be applied to the overlay already on screen.
+	 */
+	async function reopenOverlay(): Promise<void> {
+		const pending = openPromise;
+		closeOverlay();
+		// Wait for the teardown: opening again before custom() has settled is
+		// refused as an overlay that is already open.
+		await pending;
+		syncOverlay();
+	}
+
+	/**
+	 * In regular mode the terminal owns the scrollback, so scrolling carries
+	 * the panel away with the transcript: nothing drawn into the output can
+	 * stay put. Said once per session, because it is a setting, not a bug.
+	 */
+	function warnAboutScrollback(context: ExtensionContext): void {
+		if (warnedAboutScrollback || tui?.mode !== "regular") return;
+		warnedAboutScrollback = true;
+		context.ui.notify(
+			'Regular TUI mode: scrolling the terminal takes the panel with it. Set tuiMode to "fullscreen" in settings.json for a panel that stays put.',
+			"info",
+		);
+	}
+
 	async function openOverlay(context: ExtensionContext): Promise<void> {
 		if (context.mode !== "tui" || overlayOpen || !store.get()) return;
 		overlayOpen = true;
-		void context.ui
+		openPromise = context.ui
 			.custom<void>(
 				(activeTui, theme, _keybindings, done) => {
 					tui = activeTui;
@@ -130,22 +192,9 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 				},
 				{
 					overlay: true,
-					// A function so a `/plan anchor` or resize takes effect without
-					// rebuilding the overlay.
-					overlayOptions: () => ({
-						anchor: config.anchor,
-						width: config.width,
-						minWidth: 20,
-						// A safety net for a short terminal: a long plan is cut from
-						// the bottom rather than allowed to reach the editor.
-						maxHeight: "60%",
-						margin: { left: 1, right: 1, top: 0, bottom: 1 },
-						// Below this the framed panel is more noise than signal.
-						visible: (termWidth: number) => termWidth >= 24,
-						// The editor keeps focus and every keystroke: the panel is a
-						// spectator, not a dialog.
-						nonCapturing: true,
-					}),
+					// A function, because pi resolves these when the overlay is
+					// shown: rebuilding the overlay is what re-reads them.
+					overlayOptions: () => overlayOptions(config),
 				},
 			)
 			.catch(() => {
@@ -159,6 +208,8 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 				panel = undefined;
 				closing = undefined;
 			});
+		warnAboutScrollback(context);
+		await openPromise;
 	}
 
 	/** Show or hide the panel to match the plan and the user's preference. */
@@ -169,21 +220,8 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 		else closeOverlay();
 	}
 
-	async function setVisible(visible: boolean, context: ExtensionCommandContext, persist = true): Promise<void> {
-		const previous = config.visible;
-		config = { ...config, visible };
-		if (persist) {
-			const file = globalSettingsPath();
-			try {
-				await withFileMutationQueue(file, async () => {
-					await writeSettings(file, configPatch(config, { visible }));
-				});
-			} catch (error) {
-				config = { ...config, visible: previous };
-				context.ui.notify(`Could not save to ${file}: ${error instanceof Error ? error.message : String(error)}`, "error");
-				return;
-			}
-		}
+	async function setVisible(visible: boolean, context: ExtensionCommandContext): Promise<void> {
+		if (!(await persistChanges({ visible }, context))) return;
 		syncOverlay();
 		context.ui.notify(visible ? "Plan panel shown." : "Plan panel hidden.", "info");
 	}
@@ -349,21 +387,31 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 						return;
 					}
 					const anchor = argument.toLowerCase() as PlanAnchor;
-					const file = globalSettingsPath();
-					const previous = config.anchor;
-					config = { ...config, anchor };
-					try {
-						await withFileMutationQueue(file, async () => {
-							await writeSettings(file, configPatch(config, { anchor }));
-						});
-					} catch (error) {
-						config = { ...config, anchor: previous };
-						commandCtx.ui.notify(`Could not save to ${file}: ${error instanceof Error ? error.message : String(error)}`, "error");
+					if (!(await persistChanges({ anchor }, commandCtx))) return;
+					await reopenOverlay();
+					commandCtx.ui.notify(`Panel anchored ${anchor}.`, "info");
+					return;
+				}
+
+				case "padding": {
+					if (argument === "") {
+						commandCtx.ui.notify(describePosition(), "info");
 						return;
 					}
-					panel?.invalidate();
-					tui?.requestRender();
-					commandCtx.ui.notify(`Panel anchored ${anchor}.`, "info");
+					// Whole rows and columns only: anything else would be silently
+					// rounded by the terminal layout.
+					if (!/^\d{1,3}$/.test(argument) || Number.parseInt(argument, 10) > MAX_PADDING) {
+						commandCtx.ui.notify(`"${argument}" is not a padding. Use a whole number of rows and columns, 0 to ${MAX_PADDING}.`, "warning");
+						return;
+					}
+					const padding = Number.parseInt(argument, 10);
+					if (padding === config.padding) {
+						commandCtx.ui.notify(describePosition(), "info");
+						return;
+					}
+					if (!(await persistChanges({ padding }, commandCtx))) return;
+					await reopenOverlay();
+					commandCtx.ui.notify(`Panel padding ${padding}.`, "info");
 					return;
 				}
 
@@ -381,6 +429,7 @@ export default async function floatingPlan(pi: ExtensionAPI) {
 							"/plan note <text>     annotate the plan",
 							"/plan clear           drop the plan",
 							`/plan anchor <corner> float in top-center (default), bottom-right, …`,
+							"/plan padding <n>    keep n rows/columns from the nearest edges",
 						].join("\n"),
 						"info",
 					);

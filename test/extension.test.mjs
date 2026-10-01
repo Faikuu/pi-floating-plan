@@ -24,7 +24,7 @@ function fakeRuntime(options = {}) {
 	const commands = new Map();
 	const shortcuts = new Map();
 	const tools = new Map();
-	const calls = { notifications: [], custom: 0, openOverlays: 0, closed: 0, widgets: new Map() };
+	const calls = { notifications: [], custom: 0, openOverlays: 0, closed: 0, widgets: new Map(), overlayOptions: [] };
 
 	const pi = {
 		on(name, handler) {
@@ -57,9 +57,12 @@ function fakeRuntime(options = {}) {
 			custom: async (factory, opts) => {
 				calls.custom++;
 				if (opts?.overlay) calls.openOverlays++;
+				// pi resolves the placement when the overlay is shown, so this is
+				// the one the panel actually gets.
+				calls.overlayOptions.push(typeof opts?.overlayOptions === "function" ? opts.overlayOptions() : opts?.overlayOptions);
 				let done;
 				const component = factory(
-					{ requestRender: () => {} },
+					{ requestRender: () => {}, mode: options.tuiMode },
 					THEME,
 					{},
 					(result) => {
@@ -213,6 +216,81 @@ test("/plan lists the plan and explains itself", async () => {
 	assert.match(runtime.calls.notifications.at(-1).message, /1\. \[>\] a step/);
 	await plan("help", runtime.ctx);
 	assert.match(runtime.calls.notifications.at(-1).message, /\/plan anchor/);
+	assert.match(runtime.calls.notifications.at(-1).message, /\/plan padding/);
+});
+
+test("the panel opens with the anchor and padding from settings", async () => {
+	const runtime = await start({ settings: { floatingPlan: { anchor: "bottom-right", padding: 4 } } });
+	await runtime.emit("tool_result", {
+		toolName: "todo",
+		details: { steps: [{ text: "a", status: "pending" }] },
+		content: [],
+	});
+	assert.deepEqual(runtime.calls.overlayOptions.at(-1).margin, { top: 4, right: 4, bottom: 4, left: 4 });
+	assert.equal(runtime.calls.overlayOptions.at(-1).anchor, "bottom-right");
+});
+
+test("/plan padding moves the panel and is persisted", async () => {
+	const runtime = await start();
+	await runtime.emit("tool_result", { toolName: "todo", details: { steps: [{ text: "a", status: "pending" }] }, content: [] });
+	const shown = runtime.calls.overlayOptions.length;
+	const plan = runtime.commands.get("plan").handler;
+
+	await plan("padding 5", runtime.ctx);
+	assert.deepEqual(runtime.calls.overlayOptions.at(-1).margin, { top: 5, right: 5, bottom: 5, left: 5 });
+	assert.ok(runtime.calls.overlayOptions.length > shown, "the overlay was rebuilt: pi reads the placement once, when shown");
+	assert.match(runtime.calls.notifications.at(-1).message, /padding 5/i);
+
+	const { readFile } = await import("node:fs/promises");
+	const settings = JSON.parse(await readFile(join(scratchAgentDir, "settings.json"), "utf8"));
+	assert.equal(settings.floatingPlan.padding, 5);
+});
+
+test("/plan padding reports the placement when given no argument", async () => {
+	const runtime = await start({ settings: { floatingPlan: { padding: 0 } } });
+	await runtime.commands.get("plan").handler("padding", runtime.ctx);
+	assert.match(runtime.calls.notifications.at(-1).message, /anchored top-center, 0 rows\/columns/);
+});
+
+test("/plan padding refuses anything that is not a whole number of cells", async () => {
+	const runtime = await start();
+	const plan = runtime.commands.get("plan").handler;
+	for (const argument of ["two", "-1", "2.5", "1e3", "999"]) {
+		await plan(`padding ${argument}`, runtime.ctx);
+		assert.match(runtime.calls.notifications.at(-1).message, /not a padding/, `rejects "${argument}"`);
+	}
+	const { readFile } = await import("node:fs/promises");
+	const settings = JSON.parse(await readFile(join(scratchAgentDir, "settings.json"), "utf8"));
+	assert.equal(settings.floatingPlan, undefined, "and nothing was written");
+});
+
+test("/plan anchor rebuilds the overlay so the new corner takes effect", async () => {
+	const runtime = await start();
+	await runtime.emit("tool_result", { toolName: "todo", details: { steps: [{ text: "a", status: "pending" }] }, content: [] });
+	const shown = runtime.calls.overlayOptions.length;
+	await runtime.commands.get("plan").handler("anchor left-center", runtime.ctx);
+	assert.equal(runtime.calls.overlayOptions.at(-1).anchor, "left-center");
+	assert.ok(runtime.calls.overlayOptions.length > shown, "the overlay was rebuilt");
+	assert.match(runtime.calls.notifications.at(-1).message, /anchored left-center/);
+});
+
+test("regular mode is explained once, because scrolling takes the panel with it", async () => {
+	const runtime = await start({ tuiMode: "regular" });
+	const plan = runtime.commands.get("plan").handler;
+	await runtime.emit("tool_result", { toolName: "todo", details: { steps: [{ text: "a", status: "pending" }] }, content: [] });
+	const hints = () => runtime.calls.notifications.filter((n) => /fullscreen/.test(n.message));
+	assert.equal(hints().length, 1, "the terminal owning scrollback is worth saying once");
+	assert.match(hints()[0].message, /takes the panel with it/);
+
+	// Reopening the panel must not repeat it.
+	await plan("padding 3", runtime.ctx);
+	assert.equal(hints().length, 1);
+});
+
+test("fullscreen mode says nothing, because there the panel already stays put", async () => {
+	const runtime = await start({ tuiMode: "fullscreen" });
+	await runtime.emit("tool_result", { toolName: "todo", details: { steps: [{ text: "a", status: "pending" }] }, content: [] });
+	assert.ok(!runtime.calls.notifications.some((n) => /fullscreen/.test(n.message)));
 });
 
 test("the tool's arguments are coerced into the schema's own shape", async () => {

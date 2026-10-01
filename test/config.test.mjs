@@ -4,7 +4,8 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ANCHORS, configPatch, DEFAULT_CONFIG, parseConfig } from "../lib/config.ts";
+import { ANCHORS, configPatch, DEFAULT_CONFIG, MAX_PADDING, parseConfig } from "../lib/config.ts";
+import { overlayOptions } from "../lib/position.ts";
 import { agentDir, globalSettingsPath, readSettings, writeSettings } from "../lib/settings.ts";
 
 async function tmp() {
@@ -23,6 +24,7 @@ test("parseConfig reads each documented key", () => {
 		floatingPlan: {
 			visible: false,
 			anchor: "top-left",
+			padding: 4,
 			width: 44,
 			maxSteps: 6,
 			maxTextLength: 60,
@@ -36,6 +38,7 @@ test("parseConfig reads each documented key", () => {
 	});
 	assert.equal(config.visible, false);
 	assert.equal(config.anchor, "top-left");
+	assert.equal(config.padding, 4);
 	assert.equal(config.width, 44);
 	assert.equal(config.maxSteps, 6);
 	assert.equal(config.maxTextLength, 60);
@@ -78,8 +81,39 @@ test("a single mirror tool may be given as a string", () => {
 	assert.deepEqual(parseConfig({ floatingPlan: { mirrorTools: ["todo", "  ", 7, "todo_write"] } }).mirrorTools, ["todo", "todo_write"]);
 });
 
+test("parseConfig reads the padding, and zero is a real choice", () => {
+	assert.equal(parseConfig({ floatingPlan: { padding: 0 } }).padding, 0, "flush against the edge is allowed");
+	assert.equal(parseConfig({ floatingPlan: { padding: 3 } }).padding, 3);
+	assert.equal(parseConfig({ floatingPlan: { padding: 3.9 } }).padding, 3, "a fraction is floored, not rejected");
+	assert.equal(parseConfig({ floatingPlan: { padding: -2 } }).padding, DEFAULT_CONFIG.padding);
+	assert.equal(parseConfig({ floatingPlan: { padding: "2" } }).padding, DEFAULT_CONFIG.padding, "a string is not a padding");
+	assert.equal(parseConfig({ floatingPlan: { padding: 10_000 } }).padding, MAX_PADDING, "and an absurd one is capped");
+});
+
+test("the padding becomes the margin on all four edges", () => {
+	const { margin, anchor } = overlayOptions(parseConfig({ floatingPlan: { anchor: "bottom-right", padding: 3 } }));
+	assert.equal(anchor, "bottom-right");
+	assert.deepEqual(margin, { top: 3, right: 3, bottom: 3, left: 3 });
+});
+
+test("one padding covers every anchor, because only the two edges it touches move it", () => {
+	// pi clamps the panel inside the margin box, so the far edges of the
+	// margin never change the result: the same number works everywhere.
+	for (const anchor of ANCHORS) {
+		assert.deepEqual(overlayOptions(parseConfig({ floatingPlan: { anchor, padding: 2 } })).margin, {
+			top: 2,
+			right: 2,
+			bottom: 2,
+			left: 2,
+		});
+	}
+});
+
 test("configPatch only writes the user-facing toggles", () => {
-	assert.deepEqual(configPatch(DEFAULT_CONFIG, { visible: false }), { floatingPlan: { visible: false, anchor: "top-center", toggleKey: "alt+o" } });
+	assert.deepEqual(configPatch(DEFAULT_CONFIG, { visible: false }), {
+		floatingPlan: { visible: false, anchor: "top-center", padding: 2, toggleKey: "alt+o" },
+	});
+	assert.deepEqual(configPatch(DEFAULT_CONFIG, { padding: 5 }).floatingPlan.padding, 5, "a padding change is persisted too");
 });
 
 test("the default anchor keeps the panel off the editor", () => {
