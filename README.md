@@ -39,6 +39,7 @@ The panel is an overlay, not a dialog: it floats above the conversation while th
 | `/plan note <text>` | Annotate the plan; the note is shown under it |
 | `/plan clear` | Drop the plan and close the panel |
 | `/plan anchor <corner>` | Float in `top-center` (default), `bottom-center`, `top-left`, `top-right`, `bottom-left`, `bottom-right`, `left-center`, or `right-center` |
+| `/plan padding <n>` | Keep `n` rows and columns between the panel and the terminal edges its anchor touches (default `2`). No argument reports the current placement. |
 | `/plan help` | The same list |
 
 A step is named by its number (`/plan done 3`) or by the start of its text (`/plan done write the`), case-insensitively.
@@ -62,7 +63,10 @@ The panel is the same whichever model is driving, because nothing in the pipelin
 - **One step in progress, always.** `pending → in_progress → completed` is the whole vocabulary; anything else is folded into it.
 - **Long plans slide.** A plan longer than `maxSteps` shows a window around the step in progress, so the work you are on is never the part that got cut.
 - **Narrow terminals get a compact block.** Under `compactBelow` columns the frame is dropped for a three-line summary; under 24 columns the overlay is not shown at all.
-- **It never covers the input box.** The panel is anchored top-center and capped at 60% of the terminal height, so it grows down from the top and stops well short of the editor. `/plan anchor` moves it if you want it elsewhere.
+- **It never covers the input box.** The panel is anchored top-center, two rows down, and capped at 60% of the terminal height, so it grows down from the top and stops well short of the editor. `/plan anchor` and `/plan padding` move it if you want it elsewhere.
+- **The padding is one number.** The panel keeps that distance from the two edges its anchor touches — top and left for `top-left`, bottom and right for `bottom-right` — because the far edges cannot move it. Both commands write to `settings.json` and take effect immediately, without restarting pi.
+- **The panel is pinned to the screen, not to the transcript.** Scrolling the conversation moves the document underneath it; the panel stays exactly where it was put.
+- **…as long as pi owns the viewport.** In `tuiMode: "fullscreen"` (the default) pi repaints the whole screen, so a floating panel really does float. In `"regular"` mode the terminal owns the scrollback, so scrolling carries the panel away with everything else — nothing an extension draws into the output can stay put. The panel says so once, when it opens in regular mode.
 
 ## Configuration
 
@@ -73,6 +77,7 @@ Optional block in `<agent-dir>/settings.json` (default `~/.pi/agent/settings.jso
   "floatingPlan": {
     "visible": true,
     "anchor": "top-center",
+    "padding": 2,
     "width": 38,
     "maxSteps": 24,
     "maxTextLength": 140,
@@ -90,6 +95,7 @@ Optional block in `<agent-dir>/settings.json` (default `~/.pi/agent/settings.jso
 |---|---|---|
 | `visible` | `true` | Show the panel as soon as a plan exists. `/plan show` and `/plan hide` write this. |
 | `anchor` | `top-center` | Where the panel floats. The default is at the top because pi draws the editor along the bottom of the screen. |
+| `padding` | `2` | Rows and columns between the panel and the edges its anchor touches, `0` to `20`. `/plan anchor` and `/plan padding` write this. |
 | `width` | `38` | Frame width in columns, capped at 120 and at the terminal's width. |
 | `maxSteps` | `24` | Steps shown at once; the window follows the current step. |
 | `maxTextLength` | `140` | Characters per step before it is elided. |
@@ -124,7 +130,7 @@ npm test        # node:test, no build step
 npm run typecheck
 ```
 
-`lib/plan.ts` is the model-facing half and is deliberately free of pi imports, so the normalization is testable on its own. `lib/panel.ts` is the rendering half. `index.ts` wires them to pi and owns the overlay's lifetime.
+`lib/plan.ts` is the model-facing half and is deliberately free of pi imports, so the normalization is testable on its own. `lib/panel.ts` is the rendering half. `lib/position.ts` turns the `anchor` and `padding` settings into the overlay's placement, which the overlay tests use as-is. `index.ts` wires them to pi and owns the overlay's lifetime.
 
 ## License
 

@@ -24,6 +24,12 @@ export const ANCHORS = [
 
 export type PlanAnchor = (typeof ANCHORS)[number];
 
+/**
+ * Largest padding worth accepting. Past a screen or two the panel has nowhere
+ * left to float, and pi clamps the rest away anyway.
+ */
+export const MAX_PADDING = 20;
+
 export interface FloatingPlanConfig extends PlanLimits {
 	/** Show the panel as soon as a session has a plan. */
 	visible: boolean;
@@ -32,6 +38,11 @@ export interface FloatingPlanConfig extends PlanLimits {
 	 * pi draws along the bottom of the screen.
 	 */
 	anchor: PlanAnchor;
+	/**
+	 * Rows and columns the panel keeps between itself and the terminal edges
+	 * its anchor touches: top and left for `top-left`, and so on.
+	 */
+	padding: number;
 	/** Preferred frame width in columns. */
 	width: number;
 	/** Draw the completion bar. */
@@ -56,6 +67,7 @@ export interface FloatingPlanConfig extends PlanLimits {
 export const DEFAULT_CONFIG: FloatingPlanConfig = {
 	visible: true,
 	anchor: "top-center",
+	padding: 2,
 	width: 38,
 	maxSteps: 24,
 	maxTextLength: 140,
@@ -94,6 +106,7 @@ export function parseConfig(settings: Record<string, unknown>): FloatingPlanConf
 	return {
 		visible: boolean(block.visible, DEFAULT_CONFIG.visible),
 		anchor: anchor(block.anchor, DEFAULT_CONFIG.anchor),
+		padding: positiveInt(block.padding, DEFAULT_CONFIG.padding, MAX_PADDING, 0),
 		width: positiveInt(block.width, DEFAULT_CONFIG.width, 120, 16),
 		maxSteps: positiveInt(block.maxSteps, DEFAULT_CONFIG.maxSteps, 100),
 		maxTextLength: positiveInt(block.maxTextLength, DEFAULT_CONFIG.maxTextLength, 500, 20),
@@ -109,5 +122,5 @@ export function parseConfig(settings: Record<string, unknown>): FloatingPlanConf
 /** Serialize the user-facing subset back into a settings patch. */
 export function configPatch(config: FloatingPlanConfig, changes: Partial<FloatingPlanConfig>): Record<string, unknown> {
 	const next = { ...config, ...changes };
-	return { floatingPlan: { visible: next.visible, anchor: next.anchor, toggleKey: next.toggleKey } };
+	return { floatingPlan: { visible: next.visible, anchor: next.anchor, padding: next.padding, toggleKey: next.toggleKey } };
 }

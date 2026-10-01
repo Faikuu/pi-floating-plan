@@ -1,25 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { TuiMainScreen, Text, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { TuiAltScreen, TuiMainScreen, Container, ScrollView, Text, VStack, stripTerminalSequences } from "@earendil-works/pi-tui";
 
+import { DEFAULT_CONFIG, parseConfig } from "../lib/config.ts";
+import { overlayOptions } from "../lib/position.ts";
 import { PlanPanel } from "../lib/panel.ts";
 import { createPlanStore } from "../lib/plan-store.ts";
 
 /**
- * The overlay options the extension passes to `ctx.ui.custom()`, exercised
- * against a real TUI over a fake terminal. The point of the test is the
- * promise the README makes: the panel floats, and the editor keeps focus.
+ * The overlay options the extension passes to `ctx.ui.custom()`, built by the
+ * same function the extension calls, so a change to placement cannot quietly
+ * stop being tested here.
  */
-const OVERLAY_OPTIONS = {
-	anchor: "top-center",
-	width: 38,
-	minWidth: 20,
-	maxHeight: "60%",
-	margin: { left: 1, right: 1, top: 0, bottom: 1 },
-	visible: (termWidth) => termWidth >= 24,
-	nonCapturing: true,
-};
+const OVERLAY_OPTIONS = overlayOptions(DEFAULT_CONFIG);
 
 const THEME = { fg: (_color, text) => text, bold: (text) => text, italic: (text) => text, inverse: (text) => text };
 class FakeTerminal {
@@ -55,7 +49,7 @@ class FakeTerminal {
 	setProgress() {}
 }
 
-function scene(columns = 80, rows = 20) {
+function storeWithPlan() {
 	const store = createPlanStore();
 	store.set({
 		steps: [
@@ -65,14 +59,49 @@ function scene(columns = 80, rows = 20) {
 			{ text: "tests and the README", status: "pending" },
 		],
 	});
+	return store;
+}
+
+/** A main-screen TUI with the plan floating over an editor. */
+function laidOut(options = OVERLAY_OPTIONS, columns = 80, rows = 20) {
 	const terminal = new FakeTerminal(columns, rows);
 	const tui = new TuiMainScreen(terminal);
 	const editor = new Text("> ask the agent something", 0, 0);
 	tui.addChild(editor);
 	tui.setFocus(editor);
-	const handle = tui.showOverlay(new PlanPanel({ store, theme: THEME }), OVERLAY_OPTIONS);
+	const handle = tui.showOverlay(new PlanPanel({ store: storeWithPlan(), theme: THEME }), options);
 	tui.renderNow(true);
 	return { tui, terminal, editor, handle, screen: () => stripTerminalSequences(terminal.output) };
+}
+
+function scene(columns = 80, rows = 20) {
+	return laidOut(OVERLAY_OPTIONS, columns, rows);
+}
+
+/**
+ * A fullscreen TUI with a transcript long enough to scroll, which is how pi
+ * is normally run: the panel has to stay on screen while the document moves.
+ */
+function scrolledScene(columns = 80, rows = 20, lines = 200) {
+	const terminal = new FakeTerminal(columns, rows);
+	const tui = new TuiAltScreen(terminal);
+	const document = new Container();
+	for (let i = 0; i < lines; i++) document.addChild(new Text(`line ${i}`, 0, 0));
+	const transcript = new ScrollView(document, { follow: "end", primary: true });
+	const editor = new Text("> ask the agent something", 0, 0);
+	tui.setLayoutRoot(
+		new VStack([
+			{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+			{ component: editor, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+		]),
+	);
+	tui.setFocus(editor);
+	const handle = tui.showOverlay(new PlanPanel({ store: storeWithPlan(), theme: THEME }), OVERLAY_OPTIONS);
+	tui.start();
+	tui.renderNow(true);
+	// The rows of the last frame pi painted, which is what the user sees.
+	const painted = () => (tui.previousScreen ?? []).map((line) => stripTerminalSequences(line));
+	return { tui, terminal, transcript, editor, handle, painted };
 }
 
 test("the panel floats without taking focus from the editor", () => {
@@ -86,11 +115,47 @@ test("the panel is composited at the top center, clear of the editor", () => {
 	const bounds = handle.getBounds();
 	assert.ok(bounds, "the overlay was laid out");
 	assert.equal(bounds.width, 38);
-	assert.equal(bounds.row, 0, "flush with the top of the screen");
-	// Centered in the space the margins leave, and nowhere near the bottom.
-	assert.equal(bounds.col, Math.floor((80 - 2 - 38) / 2) + 1);
+	// One padding row below the top of the screen.
+	assert.equal(bounds.row, DEFAULT_CONFIG.padding);
+	// Centered in the space the padding leaves, and nowhere near the bottom.
+	assert.equal(bounds.col, DEFAULT_CONFIG.padding + Math.floor((80 - 2 * DEFAULT_CONFIG.padding - 38) / 2));
 	assert.ok(bounds.row + bounds.height <= 12, "the panel stays in the upper half of a 20-row terminal");
 	assert.match(screen(), /PLAN/);
+});
+
+test("the anchor and padding decide where the panel lands", () => {
+	const corners = [
+		["top-left", 2, { row: 2, col: 2 }],
+		["top-right", 2, { row: 2, col: 80 - 2 - 38 }],
+		["bottom-left", 0, { row: 20 - 7, col: 0 }],
+		["right-center", 1, { row: 1 + Math.floor((20 - 2 - 7) / 2), col: 80 - 1 - 38 }],
+	];
+	for (const [anchor, padding, expected] of corners) {
+		const options = overlayOptions(parseConfig({ floatingPlan: { anchor, padding } }));
+		const { handle } = laidOut(options);
+		const bounds = handle.getBounds();
+		assert.deepEqual({ row: bounds.row, col: bounds.col }, expected, `${anchor} with padding ${padding}`);
+	}
+});
+
+test("the panel stays pinned while the transcript scrolls under it", () => {
+	const { tui, transcript, handle, painted } = scrolledScene();
+	const planRows = () => painted().flatMap((line, row) => (line.includes("PLAN") || line.includes("implement the floating panel") ? [row] : []));
+	const topLine = () => painted()[0];
+
+	const bounds = handle.getBounds();
+	assert.equal(bounds.row, DEFAULT_CONFIG.padding, "laid out against the viewport, not the document");
+	const anchored = planRows();
+	assert.deepEqual(anchored, [bounds.row, bounds.row + 4], "the frame is painted where it was laid out");
+
+	for (const lines of [10, 50, 180]) {
+		const before = topLine();
+		transcript.scrollBy(-lines);
+		tui.renderNow(true);
+		assert.notEqual(topLine(), before, `the transcript really moved ${lines} lines`);
+		assert.equal(handle.getBounds().row, bounds.row, `still on the same screen row after scrolling ${lines} lines`);
+		assert.deepEqual(planRows(), anchored, `the panel did not scroll away (${lines} lines)`);
+	}
 });
 
 test("a terminal too narrow to hold the panel is left alone", () => {
